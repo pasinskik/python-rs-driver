@@ -6,91 +6,71 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 // Python exception classes
-create_exception!(errors, ScyllaError, PyException);
+create_exception!(errors, ScyllaErrorPy, PyException);
 
-create_exception!(errors, ExecutionErrorPy, ScyllaError);
+create_exception!(errors, ExecutionErrorPy, ScyllaErrorPy);
 create_exception!(errors, BadQueryErrorPy, ExecutionErrorPy);
 create_exception!(errors, RuntimeErrorPy, ExecutionErrorPy);
 create_exception!(errors, ConnectionErrorPy, ExecutionErrorPy);
 
-create_exception!(errors, DeserializationErrorPy, ScyllaError);
+create_exception!(errors, DeserializationErrorPy, ScyllaErrorPy);
 create_exception!(errors, UnsupportedTypeErrorPy, DeserializationErrorPy);
 create_exception!(errors, DecodeFailedErrorPy, DeserializationErrorPy);
 create_exception!(errors, PyConversionFailedErrorPy, DeserializationErrorPy);
-create_exception!(errors, InternalErrorPy, DeserializationErrorPy);
+create_exception!(errors, WrongDeserializerErrorPy, DeserializationErrorPy);
 
-// Rust errors
+// Policy: DriverError types are pure Rust and contain PyErr only as source
+// in cases where the error originated from Python code (e.g. during extraction or user callbacks).
+// Conversion to PyErr happens at the boundary (e.g. in #[pymethods] implementations)
+// using the From<DriverError> for PyErr implementation, which maps each DriverError variant to
+// an appropriate Python exception class and attaches any relevant information as attributes or causes.
 
-// #[derive(Debug)]
-// pub(crate) enum DriverError {
-//     Execution(DriverExecutionError),
-//     Deserialization(DriverDeserializationError),
-//     Serialization(DriverSerializationError),
-// }
+/* Rust errors */
+#[derive(Debug)]
+#[allow(dead_code)] // we will have more variants here in the future
+pub(crate) enum DriverError {
+    Execution(DriverExecutionError),
+    Deserialization(DriverDeserializationError),
+    // Serialization(DriverSerializationError),
+}
 
+impl From<DriverError> for PyErr {
+    fn from(e: DriverError) -> PyErr {
+        match e {
+            DriverError::Execution(e) => e.into(),
+            DriverError::Deserialization(e) => e.into(),
+        }
+    }
+}
+
+/* Deserialization errors */
+
+/// Errors that can occur during deserialization of CQL values into Python objects.
 #[derive(Debug)]
 pub struct DriverDeserializationError {
     pub kind: DeserializationErrorKind,
-    pub path: Vec<DeserializationErrorSegment>,
+    pub location: DeserializationErrorLocation,
 }
 
-#[derive(Debug)]
-pub enum DeserializationErrorKind {
-    UnsupportedType {
-        cql: String,
-    },
-    ScyllaDecodeFailed {
-        source: scylla_cql::deserialize::DeserializationError,
-    },
-    Python {
-        source: pyo3::PyErr,
-    },
-    Internal {
-        message: String,
-    },
+/// Structured information about where in the data the deserialization error occurred,
+/// to provide better context in error messages and for debugging.
+#[derive(Debug, Clone, Default)]
+pub struct DeserializationErrorLocation {
+    pub row: Option<usize>,
+    pub column: Option<ColumnReference>,
+    pub inner: Vec<InnerSegment>,
 }
 
-impl DriverDeserializationError {
-    pub fn with_context(mut self, segment: DeserializationErrorSegment) -> Self {
-        self.path.insert(0, segment); // prepend for natural reading
-        self
-    }
-
-    pub fn scylla(source: scylla_cql::deserialize::DeserializationError) -> Self {
-        Self {
-            kind: DeserializationErrorKind::ScyllaDecodeFailed { source },
-            path: Vec::new(),
-        }
-    }
-
-    pub fn python(source: pyo3::PyErr) -> Self {
-        Self {
-            kind: DeserializationErrorKind::Python { source },
-            path: Vec::new(),
-        }
-    }
-
-    pub fn unsupported_type(cql: impl Into<String>) -> Self {
-        Self {
-            kind: DeserializationErrorKind::UnsupportedType { cql: cql.into() },
-            path: Vec::new(),
-        }
-    }
-
-    pub fn internal(msg: impl Into<String>) -> Self {
-        Self {
-            kind: DeserializationErrorKind::Internal {
-                message: msg.into(),
-            },
-            path: Vec::new(),
-        }
-    }
-}
-
+/// Represents a reference to a column, which can be by name or by index.
 #[derive(Debug, Clone)]
-pub enum DeserializationErrorSegment {
-    Column(String),
-    Row(usize),
+pub enum ColumnReference {
+    Name(String),
+    Index(usize),
+}
+
+/// Represents a segment in the path to the value that failed to deserialize, for nested structures.
+#[derive(Debug, Clone)]
+pub enum InnerSegment {
     ListIndex(usize),
     MapIndex(usize),
     TupleIndex(usize),
@@ -98,80 +78,508 @@ pub enum DeserializationErrorSegment {
     VectorIndex(usize),
 }
 
-/// Format the error path into a string for error messages
-fn format_path(path: &[DeserializationErrorSegment]) -> String {
-    if path.is_empty() {
-        return String::new();
+#[derive(Debug)]
+pub enum DeserializationErrorKind {
+    /// The CQL type is not supported by the deserializer
+    /// (e.g. an unknown custom type, or a new type added in Scylla that we haven't implemented yet).
+    UnsupportedType { cql: String },
+    /// An error occurred during deserialization in the scylla_cql crate.
+    ScyllaDecodeFailed {
+        source: Box<scylla_cql::deserialize::DeserializationError>,
+    },
+    /// An error occurred during conversion to a Python object
+    /// (e.g. invalid UTF-8, unsupported type for Python conversion, etc.).
+    Python { source: Box<pyo3::PyErr> },
+    /// Driver invariant violated: a deserializer was called for a mismatched ColumnType.
+    /// This indicates a bug in our dispatch logic.
+    WrongDeserializer { expected: &'static str, got: String },
+}
+
+impl DriverDeserializationError {
+    /* Constructors */
+
+    #[must_use]
+    pub fn unsupported_type(cql: impl Into<String>) -> Self {
+        Self {
+            kind: DeserializationErrorKind::UnsupportedType { cql: cql.into() },
+            location: DeserializationErrorLocation::default(),
+        }
     }
-    let mut parts = Vec::with_capacity(path.len());
-    for seg in path {
+
+    #[must_use]
+    pub fn scylla(source: scylla_cql::deserialize::DeserializationError) -> Self {
+        Self {
+            kind: DeserializationErrorKind::ScyllaDecodeFailed {
+                source: Box::new(source),
+            },
+            location: DeserializationErrorLocation::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn python(source: pyo3::PyErr) -> Self {
+        Self {
+            kind: DeserializationErrorKind::Python {
+                source: Box::new(source),
+            },
+            location: DeserializationErrorLocation::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn wrong_deserializer(expected: &'static str, got: String) -> Self {
+        Self {
+            kind: DeserializationErrorKind::WrongDeserializer { expected, got },
+            location: DeserializationErrorLocation::default(),
+        }
+    }
+
+    /* Row and column setters */
+
+    #[must_use]
+    pub fn at_row(mut self, row: usize) -> Self {
+        self.location.row = Some(row);
+        self
+    }
+
+    #[must_use]
+    pub fn at_column_name(mut self, name: impl Into<String>) -> Self {
+        self.location.column = Some(ColumnReference::Name(name.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn at_column_index(mut self, index: usize) -> Self {
+        self.location.column = Some(ColumnReference::Index(index));
+        self
+    }
+
+    /* Inner path pushers (nesting) */
+
+    #[must_use]
+    pub fn in_list_index(mut self, index: usize) -> Self {
+        self.location.inner.push(InnerSegment::ListIndex(index));
+        self
+    }
+
+    #[must_use]
+    pub fn in_map_index(mut self, index: usize) -> Self {
+        self.location.inner.push(InnerSegment::MapIndex(index));
+        self
+    }
+
+    #[must_use]
+    pub fn in_tuple_index(mut self, index: usize) -> Self {
+        self.location.inner.push(InnerSegment::TupleIndex(index));
+        self
+    }
+
+    #[must_use]
+    pub fn in_udt_field(mut self, field: impl Into<String>) -> Self {
+        self.location
+            .inner
+            .push(InnerSegment::UdtField(field.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn in_vector_index(mut self, index: usize) -> Self {
+        self.location.inner.push(InnerSegment::VectorIndex(index));
+        self
+    }
+}
+
+/// Helper function to format the location information into a human-readable string for error messages.
+fn format_location(loc: &DeserializationErrorLocation) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(row) = loc.row {
+        parts.push(format!("row={row}"));
+    }
+
+    if let Some(col) = &loc.column {
+        match col {
+            ColumnReference::Name(name) => parts.push(format!("column={name}")),
+            ColumnReference::Index(i) => parts.push(format!("column_index={i}")),
+        }
+    }
+
+    for seg in &loc.inner {
         let s = match seg {
-            DeserializationErrorSegment::Column(name) => format!("column={name}"),
-            DeserializationErrorSegment::Row(i) => format!("row={i}"),
-            DeserializationErrorSegment::ListIndex(i) => format!("list[{i}]"),
-            DeserializationErrorSegment::MapIndex(i) => format!("map[{i}]"),
-            DeserializationErrorSegment::TupleIndex(i) => format!("tuple[{i}]"),
-            DeserializationErrorSegment::UdtField(f) => format!("udt.{f}"),
-            DeserializationErrorSegment::VectorIndex(i) => format!("vector[{i}]"),
+            InnerSegment::ListIndex(i) => format!("list[{i}]"),
+            InnerSegment::MapIndex(i) => format!("map[{i}]"),
+            InnerSegment::TupleIndex(i) => format!("tuple[{i}]"),
+            InnerSegment::UdtField(f) => format!("udt.{f}"),
+            InnerSegment::VectorIndex(i) => format!("vector[{i}]"),
         };
         parts.push(s);
     }
-    format!(" ({})", parts.join(" -> "))
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(" -> "))
+    }
 }
 
-/// Format a PyErr into a string "TypeName: message"
-fn format_pyerr(e: &pyo3::PyErr) -> String {
-    Python::attach(|py| {
-        // name() returns a Python string object (Bound<PyString>) in this PyO3 version
-        let ty_name = match e.get_type(py).name() {
-            Ok(n) => n.to_string_lossy().into_owned(),
-            Err(_) => "UnknownError".to_string(),
-        };
+/// Attaches location attributes to the given Python exception instance
+/// based on the provided `DeserializationErrorLocation`.
+fn attach_location_attrs(
+    py: Python<'_>,
+    err: &Bound<'_, pyo3::PyAny>, // The exception instance we're attaching attributes to
+    loc: &DeserializationErrorLocation,
+) {
+    // Row
+    if let Some(row) = loc.row {
+        let _ = err.setattr("row", row);
+    } else {
+        let _ = err.setattr("row", py.None());
+    }
 
-        let msg = e.value(py).to_string();
-
-        if msg.is_empty() {
-            ty_name
-        } else {
-            format!("{ty_name}: {msg}")
+    // Column
+    match &loc.column {
+        Some(ColumnReference::Name(name)) => {
+            let _ = err.setattr("column_name", name.as_str());
+            let _ = err.setattr("column_index", py.None());
         }
-    })
+        Some(ColumnReference::Index(i)) => {
+            let _ = err.setattr("column_index", *i);
+            let _ = err.setattr("column_name", py.None());
+        }
+        None => {
+            let _ = err.setattr("column_name", py.None());
+            let _ = err.setattr("column_index", py.None());
+        }
+    }
+
+    // Inner path - we convert the inner path segments into a list of tuples for better structure in Python
+    let inner_list = pyo3::types::PyList::empty(py);
+    for seg in &loc.inner {
+        let item = match seg {
+            InnerSegment::ListIndex(i) => ("list", *i).into_pyobject(py).unwrap().into_any(),
+            InnerSegment::MapIndex(i) => ("map", *i).into_pyobject(py).unwrap().into_any(),
+            InnerSegment::TupleIndex(i) => ("tuple", *i).into_pyobject(py).unwrap().into_any(),
+            InnerSegment::UdtField(f) => ("udt_field", f.as_str())
+                .into_pyobject(py)
+                .unwrap()
+                .into_any(),
+            InnerSegment::VectorIndex(i) => ("vector", *i).into_pyobject(py).unwrap().into_any(),
+        };
+        let _ = inner_list.append(item);
+    }
+    let _ = err.setattr("inner_path", inner_list);
 }
 
 impl From<DriverDeserializationError> for PyErr {
     fn from(e: DriverDeserializationError) -> PyErr {
-        let ctx = format_path(&e.path);
-
         Python::attach(|py| {
+            let location_as_string = format_location(&e.location);
+
             match e.kind {
                 DeserializationErrorKind::UnsupportedType { cql } => {
-                    UnsupportedTypeErrorPy::new_err(format!("{cql}{ctx}"))
-                }
-                DeserializationErrorKind::ScyllaDecodeFailed { source } => {
-                    DecodeFailedErrorPy::new_err(format!("{}{ctx}", source))
-                }
-                DeserializationErrorKind::Python { source } => {
-                    // Create custom Driver exception
-                    let base = format_pyerr(&source); // e.g. "TypeError: unhashable type: 'list'"
-                    let msg = if ctx.is_empty() {
-                        format!("Python conversion failed: {base}")
+                    let message = if location_as_string.is_empty() {
+                        cql
                     } else {
-                        format!("Python conversion failed: {base}{ctx}")
+                        format!("{cql}{location_as_string}")
                     };
-                    let new_err = PyConversionFailedErrorPy::new_err(msg);
 
-                    // Attach the original PyErr as the cause
-                    new_err.set_cause(py, Some(source));
+                    let err = UnsupportedTypeErrorPy::new_err(message);
 
-                    new_err
+                    // Set location attributes
+                    if let Ok(inst) = err.value(py).cast::<pyo3::PyAny>() {
+                        attach_location_attrs(py, inst, &e.location);
+                    }
+                    err
                 }
-                DeserializationErrorKind::Internal { message } => {
-                    InternalErrorPy::new_err(format!("{message}{ctx}"))
+
+                DeserializationErrorKind::ScyllaDecodeFailed { source } => {
+                    // We stringify the original error because scylla_cql::deserialize::DeserializationError
+                    // doesn't implement Send + Sync, so we can't attach it as a cause in the PyErr.
+                    // Instead, we include its message in our custom error and attach the location info as attributes.
+                    // We could consider changing this to an enum-based error in the future if we want to preserve
+                    // more structured information from the original error.
+                    let base = source.to_string();
+                    let message = if location_as_string.is_empty() {
+                        base
+                    } else {
+                        format!("{base}{location_as_string}")
+                    };
+
+                    let err = DecodeFailedErrorPy::new_err(message);
+
+                    // Set location attributes
+                    if let Ok(inst) = err.value(py).cast::<pyo3::PyAny>() {
+                        attach_location_attrs(py, inst, &e.location);
+                    }
+                    err
+                }
+
+                DeserializationErrorKind::Python { source } => {
+                    let message = if location_as_string.is_empty() {
+                        "Python conversion failed".to_string()
+                    } else {
+                        format!("Python conversion failed{location_as_string}")
+                    };
+
+                    let err = PyConversionFailedErrorPy::new_err(message);
+
+                    // Attach original python exception as cause
+                    err.set_cause(py, Some(*source));
+
+                    // Set location attributes on the new error instance
+                    if let Ok(inst) = err.value(py).cast::<pyo3::PyAny>() {
+                        attach_location_attrs(py, inst, &e.location);
+                    }
+                    err
+                }
+
+                DeserializationErrorKind::WrongDeserializer { expected, got } => {
+                    let message = if location_as_string.is_empty() {
+                        format!("Wrong deserializer: expected {expected}, got {got}")
+                    } else {
+                        format!(
+                            "Wrong deserializer: expected {expected}, got {got}{location_as_string}"
+                        )
+                    };
+                    let err = WrongDeserializerErrorPy::new_err(message);
+
+                    // Set location attributes
+                    if let Ok(inst) = err.value(py).cast::<pyo3::PyAny>() {
+                        attach_location_attrs(py, inst, &e.location);
+                    }
+                    err
                 }
             }
         })
     }
 }
+
+// #[derive(Debug)]
+// pub enum DriverExecutionError {
+//     BadQuery(BadQueryError),
+//     Connect(ConnectError),
+//     Runtime(RuntimeError),
+// }
+
+// #[derive(Debug)]
+// pub enum BadQueryError {
+//     /// Session.execute(...) got a request of unsupported Python type.
+//     InvalidRequestType(InvalidRequestType),
+
+//     /// Session.prepare(...) got a statement of unsupported Python type.
+//     InvalidStatementType(InvalidStatementType),
+
+//     /// Building statement config failed due to invalid user input (timeout etc.)
+//     InvalidTimeout(InvalidTimeout),
+
+//     /// Parse/validate contact points failed due to user input issues.
+//     InvalidContactPoints(InvalidContactPoints),
+
+//     /// Scylla prepare failed due to invalid CQL / invalid request.
+//     PrepareFailed(PrepareFailed),
+
+//     /// Bad user input when configuring a statement (profiles, consistency, page size etc.)
+//     ConfigureStatement(ConfigureStatementBadQuery),
+
+//     /// Bad user input when building an execution profile.
+//     BuildExecutionProfile(BuildExecutionProfileBadQuery),
+
+//     /// Bad user input when building session config (port type/range, auth options etc.)
+//     BuildSessionConfig(BuildSessionConfigBadQuery),
+// }
+
+// #[derive(Debug)]
+// pub struct InvalidRequestType {
+//     pub got_type: String,            // e.g. "list", "Foo", ...
+//     pub expected: &'static str,      // e.g. "Statement | PreparedStatement | str"
+//     pub source: Option<pyo3::PyErr>, // if the failure originated in extract/cast
+// }
+
+// #[derive(Debug)]
+// pub struct InvalidStatementType {
+//     pub got_type: String,
+//     pub expected: &'static str, // e.g. "Statement | str"
+//     pub source: Option<pyo3::PyErr>,
+// }
+
+// /// Timeout provided by user is <= 0, NaN, infinite, or cannot be parsed.
+// #[derive(Debug)]
+// pub struct InvalidTimeout {
+//     pub timeout_repr: Option<String>, // optionally store repr/value as string
+//     pub reason: TimeoutInvalidReason,
+//     pub source: Option<pyo3::PyErr>,
+// }
+
+// #[derive(Debug)]
+// pub enum TimeoutInvalidReason {
+//     NonFinite,
+//     NonPositive,
+//     WrongType,
+// }
+
+// /// Covers cases like:
+// /// - contact_points is a single string (explicitly rejected)
+// /// - contact_points not iterable
+// /// - element not a string / not utf-8
+// #[derive(Debug)]
+// pub struct InvalidContactPoints {
+//     pub reason: ContactPointsInvalidReason,
+//     pub source: Option<pyo3::PyErr>,
+// }
+
+// #[derive(Debug)]
+// pub enum ContactPointsInvalidReason {
+//     NotASequence,
+//     SingleStringRejected,
+//     ElementNotString {
+//         index: usize,
+//         got_type: Option<String>,
+//     },
+//     ElementNotUtf8 {
+//         index: usize,
+//     },
+//     EmptyList,
+//     AddrParse {
+//         index: usize,
+//         source: AddrParseError,
+//     },
+// }
+
+// /// Scylla prepare failed due to invalid CQL, invalid keyspace/table, etc.
+// #[derive(Debug)]
+// pub struct PrepareFailed {
+//     pub cql: String,
+//     pub source: PrepareFailedSource,
+// }
+
+// #[derive(Debug)]
+// pub enum PrepareFailedSource {
+//     PyErr(pyo3::PyErr), // if this came from Python-side validation unexpectedly
+//     Scylla(String),     // replace String with concrete scylla error later
+// }
+
+// /// “Statement configuration” rejected a parameter (consistency, page size, tracing, etc.)
+// #[derive(Debug)]
+// pub struct ConfigureStatementBadQuery {
+//     pub param: &'static str,         // e.g. "consistency", "page_size", "tracing"
+//     pub reason: String,              // short machine-ish reason
+//     pub source: Option<pyo3::PyErr>, // typical for extraction failures
+// }
+
+// /// Execution profile build rejected user input.
+// #[derive(Debug)]
+// pub struct BuildExecutionProfileBadQuery {
+//     pub field: &'static str, // e.g. "load_balancing", "retry_policy"
+//     pub reason: String,
+//     pub source: Option<pyo3::PyErr>,
+// }
+
+// /// Session config build rejected user input (port, auth provider, ssl context, etc.)
+// #[derive(Debug)]
+// pub struct BuildSessionConfigBadQuery {
+//     pub field: &'static str, // e.g. "port", "auth", "ssl"
+//     pub reason: String,
+//     pub source: Option<pyo3::PyErr>,
+// }
+
+// #[derive(Debug)]
+// pub enum ConnectError {
+//     /// Session::connect(...) failed.
+//     ConnectFailed(ConnectFailed),
+
+//     /// Failed to build scylla SessionConfig from Python input.
+//     BuildSessionConfig(BuildSessionConfigFailed),
+
+//     /// Parsing contact points failed (may also be classed as BadQuery; your call).
+//     ParseContactPoints(ParseContactPointsFailed),
+// }
+
+// #[derive(Debug)]
+// pub struct ConnectFailed {
+//     pub contact_points: Vec<String>,
+//     pub port: u16,
+//     pub source: ConnectFailedSource,
+// }
+
+// #[derive(Debug)]
+// pub enum ConnectFailedSource {
+//     Scylla(String), // replace with concrete scylla connect error
+//     Io(std::io::Error),
+//     PyErr(pyo3::PyErr), // if connect triggers Python callbacks; rare
+// }
+
+// #[derive(Debug)]
+// pub struct BuildSessionConfigFailed {
+//     pub contact_points: Option<Vec<String>>,
+//     pub port: Option<u16>,
+//     pub source: BuildSessionConfigSource,
+// }
+
+// #[derive(Debug)]
+// pub enum BuildSessionConfigSource {
+//     PyErr(pyo3::PyErr),
+//     Internal(String),
+// }
+
+// #[derive(Debug)]
+// pub struct ParseContactPointsFailed {
+//     pub input_type: Option<String>, // if you want to store what the Python type was
+//     pub source: ParseContactPointsSource,
+// }
+
+// #[derive(Debug)]
+// pub enum ParseContactPointsSource {
+//     PyErr(pyo3::PyErr),
+//     BadValue(String),
+// }
+
+// #[derive(Debug)]
+// pub enum RuntimeError {
+//     ExecuteUnpaged(ExecuteUnpagedRuntime),
+//     QueryUnpaged(QueryUnpagedRuntime),
+//     SpawnJoin(SpawnJoinRuntime),
+// }
+
+// #[derive(Debug)]
+// pub struct ExecuteUnpagedRuntime {
+//     pub cql: Option<String>,
+//     pub request_type: Option<String>, // e.g. "Statement" / "PreparedStatement"
+//     pub source: ExecuteRuntimeSource,
+// }
+
+// #[derive(Debug)]
+// pub enum ExecuteRuntimeSource {
+//     Scylla(String),     // replace with concrete query error type
+//     PyErr(pyo3::PyErr), // if Python callback used during execution; rare
+// }
+
+// #[derive(Debug)]
+// pub struct QueryUnpagedRuntime {
+//     pub cql: Option<String>,
+//     pub request_type: Option<String>,
+//     pub source: QueryRuntimeSource,
+// }
+
+// #[derive(Debug)]
+// pub enum QueryRuntimeSource {
+//     Scylla(String), // replace with concrete query error type
+//     PyErr(pyo3::PyErr),
+// }
+
+// #[derive(Debug)]
+// pub struct SpawnJoinRuntime {
+//     pub task: &'static str, // "execute_unpaged" / "query_unpaged" etc.
+//     pub source: tokio::task::JoinError,
+// }
+
+// impl From<DriverExecutionError> for PyErr {
+//     fn from(e: DriverExecutionError) -> PyErr {
+//         Python::attach(|py| {
+//             let msg = format!("{:?}", e);
+//             RuntimeErrorPy::new_err(msg)
+//         })
+//     }
+// }
 
 #[derive(Debug)]
 pub struct DriverExecutionError {
@@ -417,7 +825,7 @@ fn format_execution_error_message(e: &DriverExecutionError) -> String {
 
 #[pymodule]
 pub(crate) fn errors(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("ScyllaError", _py.get_type::<ScyllaError>())?;
+    module.add("ScyllaError", _py.get_type::<ScyllaErrorPy>())?;
     module.add("ExecutionError", _py.get_type::<ExecutionErrorPy>())?;
     module.add("RuntimeError", _py.get_type::<RuntimeErrorPy>())?;
     module.add("BadQueryError", _py.get_type::<BadQueryErrorPy>())?;
@@ -435,6 +843,9 @@ pub(crate) fn errors(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<
         "PyConversionFailedError",
         _py.get_type::<PyConversionFailedErrorPy>(),
     )?;
-    module.add("InternalError", _py.get_type::<InternalErrorPy>())?;
+    module.add(
+        "WrongDeserializerError",
+        _py.get_type::<WrongDeserializerErrorPy>(),
+    )?;
     Ok(())
 }

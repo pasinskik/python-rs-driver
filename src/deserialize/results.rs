@@ -1,5 +1,5 @@
 use crate::deserialize::value::{PyDeserializeValue, PyDeserializedValue};
-use crate::errors::{DeserializationErrorSegment, DriverDeserializationError};
+use crate::errors::DriverDeserializationError;
 use pyo3::exceptions::{PyRuntimeError, PyStopIteration};
 use pyo3::prelude::{PyDictMethods, PyModule, PyModuleMethods};
 use pyo3::types::{PyDict, PyString};
@@ -114,39 +114,38 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn next_column(&mut self) -> PyResult<Column> {
+    fn next_column(&mut self) -> Result<Option<Column>, DriverDeserializationError> {
         Python::attach(|py| {
-            let raw_col = self
-                .column_iterator
-                .next()
-                .ok_or_else(|| PyErr::new::<PyStopIteration, _>(""))?
-                .map_err(DriverDeserializationError::scylla)?;
+            let raw_col = match self.column_iterator.next() {
+                None => return Ok(None), // End of columns in the current row
+                Some(result) => result.map_err(DriverDeserializationError::scylla)?,
+            };
 
             let col_name_str = raw_col.spec.name().to_string();
 
             let value = PyDeserializedValue::deserialize_py(raw_col.spec.typ(), raw_col.slice, py)
                 .map_err(|e| {
-                    e.with_context(DeserializationErrorSegment::Column(col_name_str.clone()))
-                        .with_context(DeserializationErrorSegment::Row(self.row_index))
+                    e.at_row(self.row_index)
+                        .at_column_name(col_name_str.clone())
                 })?;
 
             let column_name = PyString::new(py, &col_name_str).unbind();
 
-            Ok(Column { column_name, value })
+            Ok(Some(Column { column_name, value }))
         })
     }
 
-    fn next_row(&mut self) -> PyResult<()> {
-        let column_iterator = self
-            .row_iterator
-            .next()
-            .ok_or_else(|| PyErr::new::<PyStopIteration, _>(""))?
-            .map_err(DriverDeserializationError::scylla)?;
+    fn next_row(&mut self) -> Result<bool, DriverDeserializationError> {
+        let column_iterator = match self.row_iterator.next() {
+            None => return Ok(false), // End of rows
+            Some(result) => result.map_err(DriverDeserializationError::scylla)?,
+        };
 
         self.column_iterator = column_iterator;
+
         // row_index is used for error context
         self.row_index = self.row_index.wrapping_add(1);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -216,7 +215,11 @@ impl RowColumnCursor {
 #[pymethods]
 impl RowColumnCursor {
     pub fn __next__(&mut self) -> PyResult<Column> {
-        self.yoked.with_mut_return(|view| view.next_column())
+        match self.yoked.with_mut_return(|view| view.next_column()) {
+            Ok(Some(column)) => Ok(column),
+            Ok(None) => Err(PyStopIteration::new_err(())),
+            Err(err) => Err(PyErr::from(err)),
+        }
     }
     pub fn __iter__(slf: PyRefMut<'_, Self>) -> PyRefMut<'_, Self> {
         slf
@@ -274,22 +277,26 @@ impl RowFactory {
     ///
     /// Raises
     /// ------
-    /// RuntimeError
+    /// DriverDeserializationError
     ///     If deserialization of any column fails.
     pub fn build<'py>(
         &self,
         py: Python<'py>,
         column_iterator: &Bound<'py, RowColumnCursor>,
-    ) -> PyResult<Py<PyDict>> {
+    ) -> Result<Py<PyDict>, DriverDeserializationError> {
         let mut columns = column_iterator.borrow_mut();
 
         let dict = PyDict::new(py);
+
         loop {
-            match columns.__next__() {
-                Ok(column) => dict.set_item(column.column_name, column.value)?,
-                Err(err) if err.is_instance_of::<PyStopIteration>(py) => break,
-                Err(err) => return Err(err),
-            }
+            let next = columns.yoked.with_mut_return(|view| view.next_column())?;
+
+            let Some(column) = next else {
+                break;
+            };
+
+            dict.set_item(column.column_name, column.value)
+                .map_err(DriverDeserializationError::python)?;
         }
 
         Ok(dict.into())

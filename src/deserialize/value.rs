@@ -1,5 +1,5 @@
 use crate::deserialize::conversion::{CqlDurationWrapper, CqlVarintWrapper};
-use crate::errors::{DeserializationErrorSegment, DriverDeserializationError};
+use crate::errors::DriverDeserializationError;
 use bigdecimal_04::BigDecimal;
 use chrono_04::{DateTime, NaiveTime, Utc};
 use pyo3::prelude::{PyDictMethods, PyListMethods, PyModule, PyModuleMethods, PySetMethods};
@@ -177,16 +177,15 @@ where
             .map_err(DeserializationError::new)
             .map_err(DriverDeserializationError::scylla)
             // Element i could not be read
-            .map_err(|e| e.with_context(DeserializationErrorSegment::ListIndex(i)))?;
+            .map_err(|e| e.in_list_index(i))?;
 
         let item = T::deserialize_py(elem_typ, raw, py)
             // Element i failed to deserialize
-            .map_err(|e| e.with_context(DeserializationErrorSegment::ListIndex(i)))?;
-
+            .map_err(|e| e.in_list_index(i))?;
         builder(item)
             .map_err(DriverDeserializationError::python)
             // Element i could not be added to the collection
-            .map_err(|e| e.with_context(DeserializationErrorSegment::ListIndex(i)))?;
+            .map_err(|e| e.in_list_index(i))?;
     }
 
     Ok(())
@@ -207,8 +206,10 @@ where
                 typ: CollectionType::List(elem_typ),
             } => elem_typ,
             _ => {
-                return Err(DriverDeserializationError::internal(
-                    "List deserializer called for non-list column type".to_string(),
+                let expected = "List";
+                let got = format!("{:?}", typ);
+                return Err(DriverDeserializationError::wrong_deserializer(
+                    expected, got,
                 ));
             }
         };
@@ -318,8 +319,10 @@ where
                 typ: CollectionType::Map(key_typ, value_typ),
             } => (key_typ, value_typ),
             _ => {
-                return Err(DriverDeserializationError::internal(
-                    "Map deserializer called for non-map column type".to_string(),
+                let expected = "Map";
+                let got = format!("{:?}", typ);
+                return Err(DriverDeserializationError::wrong_deserializer(
+                    expected, got,
                 ));
             }
         };
@@ -344,11 +347,10 @@ where
         let dict = PyDict::new(py);
 
         for (i, item) in map_iter.enumerate() {
-            let (key, value) =
-                item.map_err(|e| e.with_context(DeserializationErrorSegment::MapIndex(i)))?;
+            let (key, value) = item.map_err(|e| e.in_map_index(i))?;
             dict.set_item(key, value)
                 .map_err(DriverDeserializationError::python)
-                .map_err(|e| e.with_context(DeserializationErrorSegment::MapIndex(i)))?;
+                .map_err(|e| e.in_map_index(i))?;
         }
 
         Ok(PyDeserializedValue::new(dict.into_any()))
@@ -374,8 +376,10 @@ where
                 typ: CollectionType::Set(elem_typ),
             } => elem_typ,
             _ => {
-                return Err(DriverDeserializationError::internal(
-                    "Set deserializer called for non-set column type".to_string(),
+                let expected = "Set";
+                let got = format!("{:?}", typ);
+                return Err(DriverDeserializationError::wrong_deserializer(
+                    expected, got,
                 ));
             }
         };
@@ -530,8 +534,10 @@ where
                 dimensions,
             } => (element_type, dimensions),
             _ => {
-                return Err(DriverDeserializationError::internal(
-                    "Vector deserializer called for non-vector column type".to_string(),
+                let expected = "Vector";
+                let got = format!("{:?}", typ);
+                return Err(DriverDeserializationError::wrong_deserializer(
+                    expected, got,
                 ));
             }
         };
@@ -551,12 +557,11 @@ where
 
         let list = PyList::empty(py);
         for (i, value) in vector_iterator.enumerate() {
-            let value =
-                value.map_err(|e| e.with_context(DeserializationErrorSegment::VectorIndex(i)))?;
+            let value = value.map_err(|e| e.in_vector_index(i))?;
 
             list.append(value)
                 .map_err(DriverDeserializationError::python)
-                .map_err(|e| e.with_context(DeserializationErrorSegment::VectorIndex(i)))?;
+                .map_err(|e| e.in_vector_index(i))?;
         }
 
         Ok(PyDeserializedValue::new(list.into_any()))
@@ -784,19 +789,14 @@ fn deser_cql_py_value<'py, 'metadata, 'frame>(
             for ((col_name, col_type), res) in iter {
                 let v = res
                     .map_err(DriverDeserializationError::scylla)
-                    .map_err(|e| {
-                        e.with_context(DeserializationErrorSegment::UdtField(col_name.to_string()))
-                    })?;
+                    .map_err(|e| e.in_udt_field(col_name.to_string()))?;
 
-                let val = PyDeserializedValue::deserialize_py(col_type, v.flatten(), py).map_err(
-                    |e| e.with_context(DeserializationErrorSegment::UdtField(col_name.to_string())),
-                )?;
+                let val = PyDeserializedValue::deserialize_py(col_type, v.flatten(), py)
+                    .map_err(|e| e.in_udt_field(col_name.to_string()))?;
 
                 dict.set_item(col_name.to_string(), val)
                     .map_err(DriverDeserializationError::python)
-                    .map_err(|e| {
-                        e.with_context(DeserializationErrorSegment::UdtField(col_name.to_string()))
-                    })?;
+                    .map_err(|e| e.in_udt_field(col_name.to_string()))?;
             }
 
             PyDeserializedValue::new(dict.into_any())
@@ -822,7 +822,7 @@ fn deser_cql_py_value<'py, 'metadata, 'frame>(
                         // Option<&[u8]> → PyDeserializedValue
                         .and_then(|raw| PyDeserializedValue::deserialize_py(typ, raw, py))
                         // Add context about which tuple index failed
-                        .map_err(|e| e.with_context(DeserializationErrorSegment::TupleIndex(i)));
+                        .map_err(|e| e.in_tuple_index(i));
                     PyValueOrError::new(result)
                 });
 
