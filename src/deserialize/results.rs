@@ -97,73 +97,6 @@ impl RowsIterator {
     }
 }
 
-/// Yoke-backed wrapper holding row and column iterators.
-///
-/// `Cursor` is stored inside a `Yoke` so that both the row iterator
-///  and the column iterator can borrow from the same data without cloning.
-///
-/// - `next_row` advances the row iterator and switches the active column
-///   iterator to the value received from row iterator.
-/// - `next_column` advances the column iterator and deserializes column values
-///   into Python objects.
-#[derive(Yokeable)]
-struct Cursor<'a> {
-    row_iterator: RawRowIterator<'a, 'a>,
-    column_iterator: ColumnIterator<'a, 'a>,
-    row_index: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn next_column(&mut self) -> Result<Option<Column>, DriverDeserializationError> {
-        Python::attach(|py| {
-            let raw_col = match self.column_iterator.next() {
-                None => return Ok(None), // End of columns in the current row
-                Some(result) => result.map_err(DriverDeserializationError::scylla)?,
-            };
-
-            let col_name_str = raw_col.spec.name().to_string();
-
-            let value = PyDeserializedValue::deserialize_py(raw_col.spec.typ(), raw_col.slice, py)
-                .map_err(|e| {
-                    e.at_row(self.row_index)
-                        .at_column_name(col_name_str.clone())
-                })?;
-
-            let column_name = PyString::new(py, &col_name_str).unbind();
-
-            Ok(Some(Column { column_name, value }))
-        })
-    }
-
-    fn next_row(&mut self) -> Result<bool, DriverDeserializationError> {
-        let column_iterator = match self.row_iterator.next() {
-            None => return Ok(false), // End of rows
-            Some(result) => result.map_err(DriverDeserializationError::scylla)?,
-        };
-
-        self.column_iterator = column_iterator;
-
-        // row_index is used for error context
-        self.row_index = self.row_index.wrapping_add(1);
-        Ok(true)
-    }
-}
-
-/// Stable cart holding deserialized metadata and raw row data.
-///
-/// This type exists solely to serve as a `StableDeref` cart for `Yoke`.
-struct QueryResultCart(Arc<QueryResult>);
-
-impl Deref for QueryResultCart {
-    type Target = QueryResult;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-unsafe impl StableDeref for QueryResultCart {}
-
 /// Iterator over columns of the current row.
 ///
 /// This object is passed to `RowFactory.build` and allows iterating over
@@ -306,6 +239,73 @@ impl RowFactory {
 impl Default for RowFactory {
     fn default() -> Self {
         RowFactory::new()
+    }
+}
+
+/// Stable cart holding deserialized metadata and raw row data.
+///
+/// This type exists solely to serve as a `StableDeref` cart for `Yoke`.
+struct QueryResultCart(Arc<QueryResult>);
+
+impl Deref for QueryResultCart {
+    type Target = QueryResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl StableDeref for QueryResultCart {}
+
+/// Yoke-backed wrapper holding row and column iterators.
+///
+/// `Cursor` is stored inside a `Yoke` so that both the row iterator
+///  and the column iterator can borrow from the same data without cloning.
+///
+/// - `next_row` advances the row iterator and switches the active column
+///   iterator to the value received from row iterator.
+/// - `next_column` advances the column iterator and deserializes column values
+///   into Python objects.
+#[derive(Yokeable)]
+struct Cursor<'a> {
+    row_iterator: RawRowIterator<'a, 'a>,
+    column_iterator: ColumnIterator<'a, 'a>,
+    row_index: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn next_column(&mut self) -> Result<Option<Column>, DriverDeserializationError> {
+        Python::attach(|py| {
+            let raw_col = match self.column_iterator.next() {
+                None => return Ok(None), // End of columns in the current row
+                Some(result) => result.map_err(DriverDeserializationError::scylla)?,
+            };
+
+            let col_name_str = raw_col.spec.name().to_string();
+
+            let value = PyDeserializedValue::deserialize_py(raw_col.spec.typ(), raw_col.slice, py)
+                .map_err(|e| {
+                    e.at_row(self.row_index)
+                        .at_column_name(col_name_str.clone())
+                })?;
+
+            let column_name = PyString::new(py, &col_name_str).unbind();
+
+            Ok(Some(Column { column_name, value }))
+        })
+    }
+
+    fn next_row(&mut self) -> Result<bool, DriverDeserializationError> {
+        let column_iterator = match self.row_iterator.next() {
+            None => return Ok(false), // End of rows
+            Some(result) => result.map_err(DriverDeserializationError::scylla)?,
+        };
+
+        self.column_iterator = column_iterator;
+
+        // row_index is used for error context
+        self.row_index = self.row_index.wrapping_add(1);
+        Ok(true)
     }
 }
 
