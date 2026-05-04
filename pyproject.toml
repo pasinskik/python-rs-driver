@@ -26,6 +26,7 @@ dev = [
     "basedpyright",
     "python-dateutil",
     "ccm @ git+https://git@github.com/scylladb/scylla-ccm.git@master",
+    "cryptography>=49.0.0",
 ]
 
 [tool.uv]
